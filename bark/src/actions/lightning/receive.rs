@@ -4,6 +4,11 @@
 //! parameters fixed at invoice creation (htlc claim cltv delta, anti-dos
 //! token) live on the action as top-level fields; the mutable bit is
 //! [`Progress`], representing the current phase of the state machine.
+//!
+//! A *hold receive* is created for a payment hash chosen by the caller, who
+//! keeps the preimage. It advances like any other receive up to
+//! [`Progress::HtlcsReady`], then waits there until the caller supplies the
+//! preimage (see [`Wallet::settle_lightning_hold_receive`]) or abandons it.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -48,6 +53,11 @@ const AWAITING_PAYMENT_POLL_INTERVAL: Duration = Duration::from_secs(4);
 /// reaped, to avoid racing a payment that lands right at the boundary.
 const INVOICE_EXPIRY_GRACE: Duration = Duration::from_secs(60);
 
+/// The current unix time in seconds, or zero if the clock is before 1970.
+pub(crate) fn unix_now_secs() -> u64 {
+	u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
+}
+
 pub(crate) fn ln_recv_action_id(payment_hash: PaymentHash) -> WalletActionId {
 	format!("{LN_RECV_NAMESPACE}.{payment_hash}")
 }
@@ -74,7 +84,12 @@ pub struct LightningReceive {
 	// Set at invoice creation, immutable thereafter:
 	pub invoice: Bolt11Invoice,
 	pub payment_hash: PaymentHash,
-	pub payment_preimage: Preimage,
+	/// The preimage revealed to the server to claim the payment.
+	///
+	/// Always set for receives where the wallet minted the preimage. For hold
+	/// receives it stays `None` until the caller supplies it, which is the
+	/// only mutation it ever sees.
+	pub payment_preimage: Option<Preimage>,
 	pub htlc_recv_cltv_delta: BlockDelta,
 	pub anti_dos_token: Option<String>,
 	#[serde(default)]
@@ -82,6 +97,12 @@ pub struct LightningReceive {
 	/// Index of the wallet key backing the HTLC-recv vtxo and, for local
 	/// receives, the claim output.
 	pub key_index: u32,
+	/// Set only for hold receives: the unix time (in seconds) after which a
+	/// payment is no longer accepted. The bolt11 invoice carries the
+	/// server's own (much longer) expiry, so this is enforced locally by not
+	/// preparing a claim for late payments.
+	#[serde(default)]
+	pub hold_deadline: Option<u64>,
 
 	// Mutable state:
 	pub progress: Progress,
@@ -90,6 +111,45 @@ pub struct LightningReceive {
 impl LightningReceive {
 	pub fn id(&self) -> WalletActionId {
 		ln_recv_action_id(self.payment_hash)
+	}
+
+	/// Whether this is a hold receive, see the [module docs](self).
+	pub fn is_hold(&self) -> bool {
+		self.hold_deadline.is_some()
+	}
+
+	/// Whether this is a hold receive whose HTLCs have been granted and that
+	/// waits for the caller to supply the preimage.
+	pub fn is_awaiting_preimage(&self) -> bool {
+		self.is_hold()
+			&& self.payment_preimage.is_none()
+			&& matches!(self.progress, Progress::HtlcsReady(_))
+	}
+
+	/// Whether the hold deadline of a hold receive has passed. Always false
+	/// for other receives.
+	fn hold_deadline_passed(&self, now_secs: u64) -> bool {
+		self.hold_deadline.is_some_and(|deadline| now_secs > deadline)
+	}
+
+	/// Whether an unpaid receive has expired and can be reaped: past its hold
+	/// deadline for hold receives, past its bolt11 expiry otherwise, plus a
+	/// grace margin either way.
+	fn unpaid_expired(&self) -> bool {
+		match self.hold_deadline {
+			Some(deadline) => {
+				let cutoff = deadline.saturating_add(INVOICE_EXPIRY_GRACE.as_secs());
+				unix_now_secs() > cutoff
+			},
+			None => invoice_expired(&self.invoice),
+		}
+	}
+
+	/// The preimage, which every phase past [Progress::HtlcsReady] has.
+	fn require_preimage(&self) -> anyhow::Result<Preimage> {
+		self.payment_preimage.with_context(|| format!(
+			"lightning receive {} has no preimage", self.payment_hash,
+		))
 	}
 }
 
@@ -104,7 +164,7 @@ impl WalletAction for LightningReceive {
 			Progress::AwaitingPayment => {
 				match check_incoming_lightning_payment(wallet, &self).await? {
 					IncomingStatus::Pending => {
-						if invoice_expired(&self.invoice) {
+						if self.unpaid_expired() {
 							info!("Removing unpaid expired lightning receive {}", self.payment_hash);
 							return Ok(Advance::Done);
 						}
@@ -119,6 +179,14 @@ impl WalletAction for LightningReceive {
 						return Ok(Advance::Failed(err));
 					},
 					IncomingStatus::Ready => {
+						// A hold receive paid after its deadline isn't claimed: without
+						// a prepare the server fails the held HTLC back to the sender
+						// once its forward timeout passes.
+						if self.hold_deadline_passed(unix_now_secs()) {
+							info!("Not claiming lightning hold receive {} paid after its deadline",
+								self.payment_hash);
+							return Ok(Advance::Done);
+						}
 						match prepare_lightning_receive_htlcs(wallet, &self).await? {
 							Grant::Accepted(htlcs) => Progress::HtlcsReady(htlcs),
 							Grant::Rejected(err) => {
@@ -136,6 +204,15 @@ impl WalletAction for LightningReceive {
 				if is_htlc_claim_window_closed(wallet, &htlcs).await? {
 					abandon_lightning_receive(wallet, &self, &htlcs).await?;
 					return Ok(Advance::Done);
+				}
+
+				// A hold receive waits here for the caller to supply the
+				// preimage. Nothing local can make progress, so don't ask for a
+				// wake: settling re-drives the action, and so does every sync,
+				// which also re-checks the claim window above.
+				if self.payment_preimage.is_none() {
+					trace!("Lightning hold receive {} awaits its preimage", self.payment_hash);
+					return Ok(Advance::Park { state: self, wake_after: None, error: None });
 				}
 
 				match claim_lightning_receive_htlcs(wallet, &self, &htlcs, &mut preimage_revealed).await {
@@ -303,6 +380,28 @@ pub enum LightningReceiveState {
 	Settled(SettledLightningReceive),
 }
 
+/// Why an operation on a hold receive was refused.
+///
+/// Returned inside the [anyhow::Error] of the hold receive methods on
+/// [Wallet], so callers can tell refusals apart from transient failures by
+/// downcasting.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HoldReceiveError {
+	#[error("a lightning receive for payment hash {0} already exists")]
+	AlreadyExists(PaymentHash),
+	#[error("no lightning receive found for payment hash {0}")]
+	NotFound(PaymentHash),
+	#[error("lightning receive {0} is not a hold receive")]
+	NotHoldReceive(PaymentHash),
+	#[error("preimage does not match payment hash {0}")]
+	PreimageMismatch(PaymentHash),
+	#[error("lightning hold receive {payment_hash}: {reason}")]
+	InvalidState {
+		payment_hash: PaymentHash,
+		reason: &'static str,
+	},
+}
+
 /// Outcome of polling the server for an inbound payment while in
 /// [`Progress::AwaitingPayment`].
 pub(crate) enum IncomingStatus {
@@ -314,12 +413,46 @@ pub(crate) enum IncomingStatus {
 	Canceled,
 }
 
+/// Who holds the preimage of a new lightning receive.
+pub(crate) enum ReceiveSecret {
+	/// The wallet mints a fresh preimage and claims as soon as the payment
+	/// arrives.
+	Fresh,
+	/// The caller holds the preimage of `payment_hash` and supplies it later:
+	/// a hold receive, accepting payments until `deadline` (unix seconds).
+	Hold {
+		payment_hash: PaymentHash,
+		deadline: u64,
+	},
+}
+
+/// The CLTV delta to ask the server to put between the chain tip and the
+/// expiry of the HTLC-recv vtxos, given the `required` minimum (see
+/// [start_lightning_receive]) and the server's `max`.
+///
+/// Hold receives ask for the maximum: every block above the minimum is a
+/// block the HTLC-recv vtxos can wait for the preimage before
+/// [is_htlc_claim_window_closed] forces us to abandon them.
+fn choose_htlc_recv_cltv_delta(
+	required: BlockDelta,
+	max: BlockDelta,
+	hold: bool,
+) -> anyhow::Result<BlockDelta> {
+	if required > max {
+		bail!("HTLC CLTV delta ({}) is greater than Server's max HTLC recv CLTV delta: {}",
+			required, max,
+		);
+	}
+	Ok(if hold { max } else { required })
+}
+
 /// Mint a bolt11 invoice and build a fresh [`LightningReceive`] in
 /// [`Progress::AwaitingPayment`]. The executor persists the returned
 /// state; the caller is responsible for checkpoint existence checks.
 pub(crate) async fn start_lightning_receive(
 	wallet: &Wallet,
 	amount: Amount,
+	secret: ReceiveSecret,
 	description: Option<String>,
 	token: Option<String>,
 	claim_destination: Option<ark::Address>,
@@ -343,23 +476,30 @@ pub(crate) async fn start_lightning_receive(
 	// - vtxo exit delta + htlc expiry delta (time to exit the vtxo before the htlc expires)
 	// - vtxo exit margin (time to exit the vtxo before the htlc expires)
 	// - htlc recv claim delta (time to claim the htlc before it expires)
-	let requested_min_cltv_delta = ark_info.vtxo_exit_delta
+	let required_min_cltv_delta = ark_info.vtxo_exit_delta
 		.checked_add(ark_info.htlc_expiry_delta)
 		.and_then(|v| v.checked_add(config.vtxo_exit_margin))
 		.and_then(|v| v.checked_add(config.htlc_recv_claim_delta))
 		.and_then(|v| v.checked_add(LIGHTNING_PREPARE_CLAIM_DELTA))
 		.context("HTLC CLTV delta components sum overflows")?;
 
-	if requested_min_cltv_delta > ark_info.max_user_invoice_cltv_delta {
-		bail!("HTLC CLTV delta ({}) is greater than Server's max HTLC recv CLTV delta: {}",
-			requested_min_cltv_delta,
-			ark_info.max_user_invoice_cltv_delta,
-		);
-	}
+	let is_hold = matches!(secret, ReceiveSecret::Hold { .. });
+	let requested_min_cltv_delta = choose_htlc_recv_cltv_delta(
+		required_min_cltv_delta, ark_info.max_user_invoice_cltv_delta, is_hold,
+	)?;
 
-	let preimage = Preimage::random();
-	let payment_hash = preimage.compute_payment_hash();
-	info!("Start bolt11 receive with payment hash: {}", payment_hash);
+	let (payment_hash, payment_preimage, hold_deadline) = match secret {
+		ReceiveSecret::Fresh => {
+			let preimage = Preimage::random();
+			(preimage.compute_payment_hash(), Some(preimage), None)
+		},
+		ReceiveSecret::Hold { payment_hash, deadline } => (payment_hash, None, Some(deadline)),
+	};
+	if is_hold {
+		info!("Start bolt11 hold receive with payment hash: {}", payment_hash);
+	} else {
+		info!("Start bolt11 receive with payment hash: {}", payment_hash);
+	}
 
 	let mailbox_kp = wallet.inner.seed.to_mailbox_keypair();
 	let mailbox_id = ark::mailbox::MailboxIdentifier::from_pubkey(mailbox_kp.public_key());
@@ -378,17 +518,26 @@ pub(crate) async fn start_lightning_receive(
 	let invoice = Bolt11Invoice::from_str(&resp.bolt11)
 		.context("invalid bolt11 invoice returned by Ark server")?;
 	validate_bolt11_payment_hash(&invoice, payment_hash)?;
+	if is_hold {
+		// The server hands back the existing invoice when the caller-chosen
+		// payment hash already has one, which can be for another amount.
+		ensure!(invoice.amount_milli_satoshis() == Some(amount.to_sat() * 1000),
+			"Ark server returned invoice for {:?} msat, expected {}",
+			invoice.amount_milli_satoshis(), amount,
+		);
+	}
 
 	let (_, key_index) = wallet.derive_store_next_keypair().await?;
 
 	Ok(LightningReceive {
 		invoice,
 		payment_hash,
-		payment_preimage: preimage,
+		payment_preimage,
 		htlc_recv_cltv_delta: requested_min_cltv_delta,
 		anti_dos_token: token,
 		claim_destination,
 		key_index,
+		hold_deadline,
 		progress: Progress::AwaitingPayment,
 	})
 }
@@ -609,7 +758,7 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
 			.effective_balance(htlc_amount.to_signed().context("htlc amount out of range")?)
 			.fee(fee)
 			.metadata(LightningMovement::metadata(
-				payment_hash, &vtxos, Some(recv.payment_preimage),
+				payment_hash, &vtxos, recv.payment_preimage,
 			))
 			.received_on([MovementDestination::new(recv.invoice.clone().into(), received)]),
 	).await.context("failed to create lightning receive movement")?;
@@ -643,6 +792,7 @@ async fn claim_lightning_receive_htlcs(
 	htlcs: &Htlcs,
 	preimage_revealed: &mut bool,
 ) -> Result<Option<Delivery>, AdvanceError> {
+	let preimage = recv.require_preimage()?;
 	let (mut srv, _) = wallet.require_server().await?;
 
 	// Order inputs by vtxoid before generating nonces, then hydrate to
@@ -675,7 +825,7 @@ async fn claim_lightning_receive_htlcs(
 	let package_cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	let resp = srv.client.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: recv.payment_hash.to_byte_array().to_vec(),
-		payment_preimage: recv.payment_preimage.to_vec(),
+		payment_preimage: preimage.to_vec(),
 		cosign_request: Some(package_cosign_request),
 	}).await.map_err(AdvanceError::Server)?.into_inner();
 	let cosign_resp = resp.try_into().context("invalid cosign response")?;
@@ -726,17 +876,24 @@ async fn claim_lightning_receive_htlcs(
 	wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await?;
 	wallet.store_vtxos(&outputs, &VtxoState::Spendable).await?;
 
+	let mut movement_update = MovementUpdate::new()
+		.effective_balance(effective_balance.to_signed().context("effective balance out of range")?)
+		.produced_vtxos(&outputs);
+	if recv.is_hold() {
+		// The movement was created before the hold receive had a preimage.
+		movement_update = movement_update.metadata(LightningMovement::metadata(
+			recv.payment_hash, &htlcs.vtxo_ids, Some(preimage),
+		));
+	}
 	wallet.inner.movements.finish_movement_with_update(
 		htlcs.movement_id,
 		MovementStatus::Successful,
-		MovementUpdate::new()
-			.effective_balance(effective_balance.to_signed().context("effective balance out of range")?)
-			.produced_vtxos(&outputs),
+		movement_update,
 	).await.context("failed to finish lightning receive movement")?;
 
 	let amount = recv.invoice.get_payment_amount(None).unwrap_or(effective_balance);
 	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+		recv.payment_hash, preimage, &recv.invoice, amount,
 	).await?;
 
 	Ok(None)
@@ -751,6 +908,7 @@ async fn deliver_lightning_receive(
 	recv: &LightningReceive,
 	delivery: &Delivery,
 ) -> Result<(), AdvanceError> {
+	let preimage = recv.require_preimage()?;
 	let destination = recv.claim_destination.as_ref()
 		.context("delivering receive has no claim destination")?;
 	deliver_vtxos_to_address(wallet, destination, &delivery.vtxos).await
@@ -767,7 +925,7 @@ async fn deliver_lightning_receive(
 
 	let amount = recv.invoice.get_payment_amount(None).unwrap_or(delivered);
 	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+		recv.payment_hash, preimage, &recv.invoice, amount,
 	).await?;
 
 	Ok(())
@@ -943,6 +1101,154 @@ mod tests {
 
 		htlc_recv_exit_blocks_needed(BlockDelta::MAX, BlockDelta::MAX, &config)
 			.expect_err("summing the deltas should overflow");
+	}
+
+	/// Hold receives ask for the server's maximum CLTV delta, other receives
+	/// for the minimum they need.
+	#[test]
+	fn choose_htlc_recv_cltv_delta_asks_max_for_hold_receives() {
+		let (required, max) = (BlockDelta::new(216), BlockDelta::new(250));
+
+		assert_eq!(choose_htlc_recv_cltv_delta(required, max, false).unwrap(), required);
+		assert_eq!(choose_htlc_recv_cltv_delta(required, max, true).unwrap(), max);
+
+		choose_htlc_recv_cltv_delta(BlockDelta::new(251), max, false)
+			.expect_err("a required delta above the max is refused");
+		choose_htlc_recv_cltv_delta(BlockDelta::new(251), max, true)
+			.expect_err("a required delta above the max is refused for hold receives too");
+	}
+
+	/// The blocks between the HTLC grant and [is_htlc_claim_window_closed]
+	/// forcing an abandon, with the default client config and the default
+	/// server parameters (vtxo exit delta 144, htlc expiry delta 40, max user
+	/// invoice CLTV delta 250).
+	///
+	/// The grant is at `htlc_expiry = prepare tip + requested delta`, and the
+	/// window closes once `tip + needed > htlc_expiry`, so the window is
+	/// `requested - needed` blocks.
+	#[test]
+	fn hold_receive_claim_window_with_default_parameters() {
+		let config = Config::network_default(bitcoin::Network::Bitcoin);
+		let (exit_delta, htlc_expiry_delta) = (BlockDelta::new(144), BlockDelta::new(40));
+		let max_user_invoice_cltv_delta = BlockDelta::new(250);
+
+		let needed = htlc_recv_exit_blocks_needed(exit_delta, htlc_expiry_delta, &config).unwrap();
+		assert_eq!(needed, BlockDelta::new(144 + 40 + 12 + 18));
+		let required = requested_cltv_delta(exit_delta, htlc_expiry_delta, &config);
+		assert_eq!(required, BlockDelta::new(216));
+
+		let regular = choose_htlc_recv_cltv_delta(required, max_user_invoice_cltv_delta, false).unwrap();
+		assert_eq!(regular.saturating_sub(needed), BlockDelta::new(2));
+
+		let hold = choose_htlc_recv_cltv_delta(required, max_user_invoice_cltv_delta, true).unwrap();
+		assert_eq!(hold.saturating_sub(needed), BlockDelta::new(36));
+	}
+
+	fn test_receive(
+		payment_preimage: Option<Preimage>,
+		hold_deadline: Option<u64>,
+		progress: Progress,
+	) -> LightningReceive {
+		let invoice = test_bolt11();
+		LightningReceive {
+			payment_hash: PaymentHash::from(&invoice),
+			invoice,
+			payment_preimage,
+			htlc_recv_cltv_delta: BlockDelta::new(216),
+			anti_dos_token: None,
+			claim_destination: None,
+			key_index: 3,
+			hold_deadline,
+			progress,
+		}
+	}
+
+	/// Checkpoints written before hold receives existed have a preimage and
+	/// no hold deadline, and must still load as regular receives.
+	#[test]
+	fn lightning_receive_checkpoint_from_before_hold_receives_deserializes() {
+		let invoice = test_bolt11();
+		let preimage_hex = "0101010101010101010101010101010101010101010101010101010101010101";
+		let json = serde_json::json!({
+			"invoice": TEST_INVOICE_STR,
+			"payment_hash": PaymentHash::from(&invoice).to_string(),
+			"payment_preimage": preimage_hex,
+			"htlc_recv_cltv_delta": 216,
+			"anti_dos_token": null,
+			"claim_destination": null,
+			"key_index": 3,
+			"progress": "AwaitingPayment",
+		});
+
+		let recv = serde_json::from_value::<LightningReceive>(json).unwrap();
+		assert_eq!(recv.payment_preimage, Some(Preimage::from_str(preimage_hex).unwrap()));
+		assert_eq!(recv.hold_deadline, None);
+		assert!(!recv.is_hold());
+		assert!(!recv.is_awaiting_preimage());
+
+		// Re-serializing keeps the preimage in the format old bark reads.
+		let json = serde_json::to_value(&recv).unwrap();
+		assert_eq!(json["payment_preimage"], serde_json::json!(preimage_hex));
+	}
+
+	#[test]
+	fn hold_receive_checkpoint_roundtrips() {
+		let htlcs = Htlcs { vtxo_ids: vec![], movement_id: MovementId::new(7) };
+		let recv = test_receive(None, Some(1_700_000_000), Progress::HtlcsReady(htlcs));
+
+		let json = serde_json::to_value(&recv).unwrap();
+		assert_eq!(json["payment_preimage"], serde_json::Value::Null);
+		assert_eq!(serde_json::from_value::<LightningReceive>(json).unwrap(), recv);
+	}
+
+	#[test]
+	fn only_hold_receives_with_htlcs_and_no_preimage_await_the_preimage() {
+		let htlcs = Htlcs { vtxo_ids: vec![], movement_id: MovementId::new(7) };
+		let preimage = Preimage::from_str(
+			"0101010101010101010101010101010101010101010101010101010101010101",
+		).unwrap();
+
+		let awaiting = test_receive(None, Some(100), Progress::HtlcsReady(htlcs.clone()));
+		assert!(awaiting.is_hold());
+		assert!(awaiting.is_awaiting_preimage());
+
+		let unpaid = test_receive(None, Some(100), Progress::AwaitingPayment);
+		assert!(!unpaid.is_awaiting_preimage());
+
+		let settled = test_receive(Some(preimage), Some(100), Progress::HtlcsReady(htlcs.clone()));
+		assert!(!settled.is_awaiting_preimage());
+
+		let regular = test_receive(Some(preimage), None, Progress::HtlcsReady(htlcs));
+		assert!(!regular.is_hold());
+		assert!(!regular.is_awaiting_preimage());
+	}
+
+	#[test]
+	fn hold_deadline_only_applies_to_hold_receives() {
+		let hold = test_receive(None, Some(100), Progress::AwaitingPayment);
+		assert!(!hold.hold_deadline_passed(99));
+		assert!(!hold.hold_deadline_passed(100));
+		assert!(hold.hold_deadline_passed(101));
+
+		let regular = test_receive(None, None, Progress::AwaitingPayment);
+		assert!(!regular.hold_deadline_passed(u64::MAX));
+	}
+
+	/// An unpaid hold receive is reaped after its own deadline, not after the
+	/// (much later) expiry of the invoice the server made for it.
+	#[test]
+	fn unpaid_hold_receive_expires_at_its_deadline() {
+		let now = unix_now_secs();
+		let grace = INVOICE_EXPIRY_GRACE.as_secs();
+
+		let expired = test_receive(None, Some(now - grace - 10), Progress::AwaitingPayment);
+		assert!(expired.unpaid_expired());
+
+		let in_grace = test_receive(None, Some(now - grace + 10), Progress::AwaitingPayment);
+		assert!(!in_grace.unpaid_expired());
+
+		let live = test_receive(None, Some(now + 3600), Progress::AwaitingPayment);
+		assert!(!live.unpaid_expired());
 	}
 
 	/// The tree only has to outlive one exit margin, far less than the whole

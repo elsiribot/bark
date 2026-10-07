@@ -402,7 +402,8 @@ async fn receive_claim_after_hold_invoice_already_settled() {
 	let preimage = wallet.lightning_receive_checkpoint(payment_hash).await
 		.expect("fetching receive checkpoint")
 		.expect("receive checkpoint should exist")
-		.payment_preimage;
+		.payment_preimage
+		.expect("a regular receive has its preimage from the start");
 
 	let mut hold_client = lightning.internal.hold_client().await;
 

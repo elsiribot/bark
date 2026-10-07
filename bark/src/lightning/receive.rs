@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Context;
 use bitcoin::Amount;
 use futures::StreamExt;
@@ -10,12 +12,16 @@ use ark::lightning::{Bolt11InvoiceExt, Preimage, PaymentHash};
 use crate::Wallet;
 use crate::actions::{DriveMode, WalletAction};
 use crate::actions::lightning::receive::{
-	Htlcs, LightningReceive, LightningReceiveState, Progress,
-	ln_recv_action_id, start_lightning_receive
+	HoldReceiveError, Htlcs, LightningReceive, LightningReceiveState, Progress, ReceiveSecret,
+	abandon_lightning_receive, ln_recv_action_id, start_lightning_receive, unix_now_secs,
 };
 use crate::movement::MovementStatus;
 use crate::movement::update::MovementUpdate;
 use crate::vtxo::VtxoStateKind;
+
+/// How long the hold receive methods wait for a concurrent drive of the same
+/// receive (e.g. a sync) to release it.
+const HOLD_RECEIVE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Wallet {
 	/// Returns every in-progress lightning receive checkpoint, newest first.
@@ -86,7 +92,7 @@ impl Wallet {
 			return Ok(Some(settled.preimage));
 		}
 		if let Some(cp) = self.lightning_receive_checkpoint(hash).await? {
-			return Ok(Some(cp.payment_preimage));
+			return Ok(cp.payment_preimage);
 		}
 		Ok(None)
 	}
@@ -121,9 +127,193 @@ impl Wallet {
 		description: Option<String>,
 		token: Option<String>,
 	) -> anyhow::Result<Bolt11Invoice> {
-		let start = start_lightning_receive(self, amount, description, token, None).await?;
+		let start = start_lightning_receive(
+			self, amount, ReceiveSecret::Fresh, description, token, None,
+		).await?;
 		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
 		Ok(start.invoice.clone())
+	}
+
+	/// Create, store and return a [`Bolt11Invoice`] for a *hold receive*: an
+	/// incoming lightning payment to a `payment_hash` whose preimage the
+	/// caller holds.
+	///
+	/// The receive advances on its own until the server has granted the
+	/// HTLC-recv vtxos ([`LightningReceive::is_awaiting_preimage`]), then
+	/// waits for the caller to either supply the preimage with
+	/// [`Self::settle_lightning_hold_receive`] or give up with
+	/// [`Self::abandon_lightning_hold_receive`].
+	///
+	/// Payments arriving more than `expiry` from now are not claimed, which
+	/// the invoice itself doesn't show: it carries the server's expiry.
+	///
+	/// The receive asks for the server's maximum CLTV delta, to leave the
+	/// caller as much time as possible between the HTLC grant and the moment
+	/// the wallet has to abandon the receive for lack of a preimage.
+	///
+	/// Fails if the wallet already has a receive for `payment_hash`.
+	pub async fn bolt11_hold_invoice(
+		&self,
+		amount: Amount,
+		payment_hash: PaymentHash,
+		description: Option<String>,
+		expiry: Duration,
+	) -> anyhow::Result<Bolt11Invoice> {
+		ensure!(!expiry.is_zero(), "hold invoice expiry must not be zero");
+
+		let key = ln_recv_action_id(payment_hash);
+		// Keep a concurrent call for the same hash from racing the checks.
+		let _guard = self.inner.lock_manager.try_lock(&key).await
+			.context("receive operation already in progress for this payment")?;
+
+		if self.lightning_receive_checkpoint(payment_hash).await?.is_some()
+			|| self.inner.db.get_settled_lightning_receive(payment_hash).await?.is_some()
+		{
+			return Err(HoldReceiveError::AlreadyExists(payment_hash).into());
+		}
+
+		let deadline = unix_now_secs().saturating_add(expiry.as_secs());
+		let secret = ReceiveSecret::Hold { payment_hash, deadline };
+		let start = start_lightning_receive(self, amount, secret, description, None, None).await?;
+		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
+		Ok(start.invoice.clone())
+	}
+
+	/// Supply the preimage of a hold receive awaiting it, and claim the
+	/// payment.
+	///
+	/// The preimage is stored before anything is revealed, so if claiming
+	/// fails on a transient error the receive keeps it and a later sync (or
+	/// another call of this method) finishes the claim.
+	///
+	/// Calling this again with the same preimage is fine, also after the
+	/// payment has been claimed.
+	///
+	/// Refusals are returned as a [`HoldReceiveError`].
+	pub async fn settle_lightning_hold_receive(
+		&self,
+		payment_hash: PaymentHash,
+		preimage: Preimage,
+	) -> anyhow::Result<()> {
+		if preimage.compute_payment_hash() != payment_hash {
+			return Err(HoldReceiveError::PreimageMismatch(payment_hash).into());
+		}
+
+		let key = ln_recv_action_id(payment_hash);
+		let guard = self.inner.lock_manager.lock(&key, HOLD_RECEIVE_LOCK_TIMEOUT).await
+			.context("receive operation already in progress for this payment")?;
+
+		let mut recv = match self.lightning_receive_checkpoint(payment_hash).await? {
+			Some(recv) => recv,
+			None => {
+				// The preimage matches the hash, so it is the one this
+				// receive was claimed with.
+				if self.inner.db.get_settled_lightning_receive(payment_hash).await?.is_some() {
+					return Ok(());
+				}
+				return Err(HoldReceiveError::NotFound(payment_hash).into());
+			},
+		};
+		if !recv.is_hold() {
+			return Err(HoldReceiveError::NotHoldReceive(payment_hash).into());
+		}
+
+		if recv.payment_preimage.is_none() {
+			match recv.progress {
+				Progress::HtlcsReady(_) => {},
+				Progress::AwaitingPayment => return Err(HoldReceiveError::InvalidState {
+					payment_hash,
+					reason: "no payment has been received yet",
+				}.into()),
+				Progress::PreimageRevealed(_) | Progress::Delivering(_) => {
+					bail!("lightning hold receive {} is past preimage disclosure without a preimage",
+						payment_hash);
+				},
+			}
+			info!("Settling lightning hold receive {}", payment_hash);
+			recv.payment_preimage = Some(preimage);
+			self.inner.db.upsert_wallet_action_checkpoint(&key, &recv.clone().into()).await?;
+		}
+
+		self.drive_action_with_guard(recv, DriveMode::UntilParkOrDone, guard).await?;
+
+		match self.lightning_receive_state(payment_hash).await {
+			Ok(LightningReceiveState::Settled(_)) => Ok(()),
+			// Still holding the preimage, e.g. parked to retry a delivery.
+			Ok(LightningReceiveState::InProgress(r)) if r.payment_preimage.is_some() => Ok(()),
+			_ => bail!("lightning hold receive {} was abandoned instead of claimed, \
+				likely because its HTLC claim window closed", payment_hash),
+		}
+	}
+
+	/// Give up on a hold receive before its preimage has been supplied.
+	///
+	/// Before the server has granted the HTLC-recv vtxos this cancels the
+	/// receive like [`Self::cancel_lightning_receive`]. After that the vtxos
+	/// are dropped unclaimed: the inbound HTLC stays held by the server until
+	/// it fails it back to the sender on invoice expiry.
+	///
+	/// Refusals are returned as a [`HoldReceiveError`].
+	pub async fn abandon_lightning_hold_receive(
+		&self,
+		payment_hash: PaymentHash,
+	) -> anyhow::Result<()> {
+		let key = ln_recv_action_id(payment_hash);
+		let _guard = self.inner.lock_manager.lock(&key, HOLD_RECEIVE_LOCK_TIMEOUT).await
+			.context("receive operation already in progress for this payment")?;
+
+		let recv = match self.lightning_receive_checkpoint(payment_hash).await? {
+			Some(recv) => recv,
+			None => {
+				if self.inner.db.get_settled_lightning_receive(payment_hash).await?.is_some() {
+					return Err(HoldReceiveError::InvalidState {
+						payment_hash,
+						reason: "the payment has already been claimed",
+					}.into());
+				}
+				return Err(HoldReceiveError::NotFound(payment_hash).into());
+			},
+		};
+		if !recv.is_hold() {
+			return Err(HoldReceiveError::NotHoldReceive(payment_hash).into());
+		}
+		if recv.payment_preimage.is_some() {
+			return Err(HoldReceiveError::InvalidState {
+				payment_hash,
+				reason: "the preimage has already been supplied",
+			}.into());
+		}
+
+		match &recv.progress {
+			Progress::AwaitingPayment => {
+				info!("Abandoning unpaid lightning hold receive {}", payment_hash);
+				self.cancel_awaiting_payment_lightning_receive(payment_hash).await
+			},
+			Progress::HtlcsReady(htlcs) => {
+				abandon_lightning_receive(self, &recv, htlcs).await?;
+				self.stop_wallet_action(&key).await
+			},
+			Progress::PreimageRevealed(_) | Progress::Delivering(_) => {
+				bail!("lightning hold receive {} is past preimage disclosure without a preimage",
+					payment_hash);
+			},
+		}
+	}
+
+	/// Drives every pending hold receive forward by one step, so late
+	/// payments and closed claim windows are handled without waiting for a
+	/// full [`Self::sync`].
+	pub async fn sync_pending_lightning_hold_receives(&self) -> anyhow::Result<()> {
+		for recv in self.pending_lightning_receives().await? {
+			if !recv.is_hold() {
+				continue;
+			}
+			let id = recv.id();
+			if let Err(e) = self.drive_action(recv, DriveMode::UntilParkOrDone).await {
+				warn!("Failed to sync lightning hold receive {}: {:#}", id, e);
+			}
+		}
+		Ok(())
 	}
 
 	/// Create, store and return a [`Bolt11Invoice`] whose claimed Ark VTXO
@@ -156,7 +346,7 @@ impl Wallet {
 		token: Option<String>,
 	) -> anyhow::Result<Bolt11Invoice> {
 		let start = start_lightning_receive(
-			self, amount, description, token, Some(claim_destination),
+			self, amount, ReceiveSecret::Fresh, description, token, Some(claim_destination),
 		).await?;
 		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
 		Ok(start.invoice.clone())
@@ -179,19 +369,7 @@ impl Wallet {
 			.context("no pending lightning receive found for this payment hash")?;
 
 		match recv.progress {
-			Progress::AwaitingPayment => {
-				// Best-effort server cancel: an abandoned hold invoice just
-				// expires server-side, so don't fail the local cancel on error.
-				if let Ok((mut srv, _)) = self.require_server().await {
-					if let Err(e) = srv.client.cancel_lightning_receive(
-						protos::CancelLightningReceiveRequest { payment_hash: hash.to_vec() },
-					).await {
-						warn!("server did not cancel lightning receive {}: {}", hash, e);
-					}
-				}
-				self.stop_wallet_action(&key).await?;
-				Ok(())
-			},
+			Progress::AwaitingPayment => self.cancel_awaiting_payment_lightning_receive(hash).await,
 			Progress::HtlcsReady(_) => {
 				bail!("cannot cancel: HTLCs already granted; the receive will complete \
 					or be abandoned near expiry");
@@ -200,6 +378,21 @@ impl Wallet {
 				bail!("cannot cancel: preimage has already been revealed");
 			},
 		}
+	}
+
+	/// Cancel a receive in [`Progress::AwaitingPayment`]. The caller must
+	/// hold the receive's action lock.
+	async fn cancel_awaiting_payment_lightning_receive(&self, hash: PaymentHash) -> anyhow::Result<()> {
+		// Best-effort server cancel: an abandoned hold invoice just
+		// expires server-side, so don't fail the local cancel on error.
+		if let Ok((mut srv, _)) = self.require_server().await {
+			if let Err(e) = srv.client.cancel_lightning_receive(
+				protos::CancelLightningReceiveRequest { payment_hash: hash.to_vec() },
+			).await {
+				warn!("server did not cancel lightning receive {}: {}", hash, e);
+			}
+		}
+		self.stop_wallet_action(&ln_recv_action_id(hash)).await
 	}
 
 	/// Fall back to exiting a stuck lightning receive's HTLC vtxos on-chain.
@@ -249,6 +442,9 @@ impl Wallet {
 		recv: &LightningReceive,
 		htlcs: &Htlcs,
 	) -> anyhow::Result<()> {
+		// The exit subsystem needs the preimage to witness the HTLC-recv spend.
+		let preimage = recv.payment_preimage
+			.context("cannot exit the HTLC vtxos of a receive without its preimage")?;
 		warn!("Exiting HTLC VTXOs for lightning receive {}", recv.payment_hash);
 
 		let mut vtxos = Vec::with_capacity(htlcs.vtxo_ids.len());
@@ -269,7 +465,7 @@ impl Wallet {
 		// on-chain HTLC-recv spend, possibly after this checkpoint is gone.
 		let amount = recv.invoice.get_payment_amount(None).unwrap_or(Amount::ZERO);
 		self.inner.db.record_settled_lightning_receive(
-			recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+			recv.payment_hash, preimage, &recv.invoice, amount,
 		).await?;
 
 		Ok(())

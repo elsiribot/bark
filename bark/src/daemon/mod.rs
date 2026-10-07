@@ -311,6 +311,13 @@ impl DaemonProcess {
 					if let Err(e) = wallet.sync_pending_offboards().await {
 						warn!("An error occured while syncing pending offboards: {e:#}");
 					}
+
+					// Other receives only move on mailbox notifications, but a
+					// hold receive also has to notice its deadline passing and its
+					// claim window closing while it waits for the preimage.
+					if let Err(e) = wallet.sync_pending_lightning_hold_receives().await {
+						warn!("An error occured while syncing pending lightning hold receives: {e:#}");
+					}
 				}
 
 				if let Err(e) = wallet.sync_onchain().await {
