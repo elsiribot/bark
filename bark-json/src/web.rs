@@ -537,6 +537,36 @@ pub struct LightningInvoiceRequest {
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct LightningHoldInvoiceRequest {
+	/// The amount to create the invoice for (in satoshis). This is the amount the payee will pay
+	/// but the final amount received by the client will have any server-configured
+	/// [LightningReceiveFees](crate::cli::fees::LightningReceiveFees) deducted.
+	pub amount_sat: u64,
+	/// The payment hash of the invoice as 64 hex characters. The caller holds its preimage and
+	/// supplies it later to settle the receive.
+	pub payment_hash: String,
+	/// Optional description embedded in the invoice as its memo.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub description: Option<String>,
+	/// For how many seconds from now a payment is accepted. A payment arriving later is not
+	/// claimed. The invoice itself carries the Ark server's expiry.
+	pub expiry_secs: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct LightningHoldSettleRequest {
+	/// The preimage of the receive's payment hash as 64 hex characters.
+	pub preimage: String,
+}
+
+/// An empty JSON object, for successful calls with nothing to report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct EmptyResponse {}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct LightningInvoiceForAddressRequest {
 	/// The amount to create invoice for (in satoshis).
 	pub amount_sat: u64,
@@ -563,6 +593,11 @@ pub struct LightningPayRequest {
 	/// the server's maximum. The server picks its default when empty.
 	#[serde(default)]
 	pub retry_for_secs: Option<u64>,
+	/// The highest lightning send fee to pay (in satoshis). The payment is
+	/// refused before any funds are committed if its fee would be higher.
+	/// Any fee is accepted when empty.
+	#[serde(default)]
+	pub max_fee_sat: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]

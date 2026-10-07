@@ -57,13 +57,16 @@ Class | Method | HTTP request | Description
 *FeesApi* | [**send_onchain_fee**](docs/FeesApi.md#send_onchain_fee) | **GET** /api/v1/fees/send-onchain | Estimate send-onchain fee
 *HistoryApi* | [**list**](docs/HistoryApi.md#list) | **GET** /api/v1/history | Get wallet history
 *HistoryApi* | [**update_metadata**](docs/HistoryApi.md#update_metadata) | **POST** /api/v1/history/{id}/metadata | Patch movement metadata
+*LightningApi* | [**abandon_hold_receive**](docs/LightningApi.md#abandon_hold_receive) | **POST** /api/v1/lightning/receives/{payment_hash}/abandon | Abandon a hold receive
 *LightningApi* | [**cancel_receive**](docs/LightningApi.md#cancel_receive) | **DELETE** /api/v1/lightning/receives/{identifier} | Cancel a pending receive
+*LightningApi* | [**generate_hold_invoice**](docs/LightningApi.md#generate_hold_invoice) | **POST** /api/v1/lightning/receives/hold-invoice | Create a BOLT11 hold invoice
 *LightningApi* | [**generate_invoice**](docs/LightningApi.md#generate_invoice) | **POST** /api/v1/lightning/receives/invoice | Create a BOLT11 invoice
 *LightningApi* | [**generate_invoice_for_address**](docs/LightningApi.md#generate_invoice_for_address) | **POST** /api/v1/lightning/receives/invoice/for-address | Create a BOLT11 invoice for an Ark address
 *LightningApi* | [**get_receive_status**](docs/LightningApi.md#get_receive_status) | **GET** /api/v1/lightning/receives/{identifier} | Get receive status
 *LightningApi* | [**get_send_status**](docs/LightningApi.md#get_send_status) | **GET** /api/v1/lightning/sends/{identifier} | Get send status
 *LightningApi* | [**list_receive_statuses**](docs/LightningApi.md#list_receive_statuses) | **GET** /api/v1/lightning/receives | List all pending receive statuses
 *LightningApi* | [**pay**](docs/LightningApi.md#pay) | **POST** /api/v1/lightning/pay | Send a Lightning payment
+*LightningApi* | [**settle_hold_receive**](docs/LightningApi.md#settle_hold_receive) | **POST** /api/v1/lightning/receives/{payment_hash}/settle | Settle a hold receive
 *MessageApi* | [**sign_message**](docs/MessageApi.md#sign_message) | **POST** /api/v1/message/sign | Sign a message
 *MessageApi* | [**verify_message**](docs/MessageApi.md#verify_message) | **POST** /api/v1/message/verify | Verify a signed message
 *NotificationsApi* | [**wait_notification**](docs/NotificationsApi.md#wait_notification) | **GET** /api/v1/notifications/wait | Long-poll for wallet notifications
@@ -224,6 +227,8 @@ Class | Method | HTTP request | Description
  - [ImportVtxoRequest](docs/ImportVtxoRequest.md)
  - [InternalServerError](docs/InternalServerError.md)
  - [InvoiceInfo](docs/InvoiceInfo.md)
+ - [LightningHoldInvoiceRequest](docs/LightningHoldInvoiceRequest.md)
+ - [LightningHoldSettleRequest](docs/LightningHoldSettleRequest.md)
  - [LightningInvoiceForAddressRequest](docs/LightningInvoiceForAddressRequest.md)
  - [LightningInvoiceRequest](docs/LightningInvoiceRequest.md)
  - [LightningPayRequest](docs/LightningPayRequest.md)

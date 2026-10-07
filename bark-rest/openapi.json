@@ -1351,7 +1351,7 @@
           "lightning"
         ],
         "summary": "Send a Lightning payment",
-        "description": "Sends a payment to a Lightning destination. Accepts a BOLT11 invoice, BOLT12 offer, or Lightning address. The `amount_sat` field is required for Lightning addresses but optional for invoices and offers. Comments are only supported for Lightning addresses.",
+        "description": "Sends a payment to a Lightning destination. Accepts a BOLT11 invoice, BOLT12 offer, or Lightning address. The `amount_sat` field is required for Lightning addresses but optional for invoices and offers. Comments are only supported for Lightning addresses. With `max_fee_sat`, the payment is refused before any funds are committed if its fee would be higher. Paying an invoice whose earlier payment failed is refused, so a failure stays final. Returns once the payment has been started, so its status can be polled right away.",
         "operationId": "pay",
         "requestBody": {
           "content": {
@@ -1415,6 +1415,58 @@
                   "items": {
                     "$ref": "#/components/schemas/LightningReceiveInfo"
                   }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/lightning/receives/hold-invoice": {
+      "post": {
+        "tags": [
+          "lightning"
+        ],
+        "summary": "Create a BOLT11 hold invoice",
+        "description": "Generates a BOLT11 invoice for a payment hash whose preimage the caller holds, creating a pending hold receive. Once the payment arrives and the Ark server has granted the HTLC-recv VTXOs, the receive's state becomes `awaiting_preimage` and it waits for the caller to settle it with the preimage or abandon it. A payment arriving after `expiry_secs` is not claimed. Fails if the wallet already has a receive for the payment hash.",
+        "operationId": "generate_hold_invoice",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LightningHoldInvoiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returns the created invoice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvoiceInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -1643,13 +1695,149 @@
         }
       }
     },
+    "/api/v1/lightning/receives/{payment_hash}/abandon": {
+      "post": {
+        "tags": [
+          "lightning"
+        ],
+        "summary": "Abandon a hold receive",
+        "description": "Gives up on a hold receive whose preimage has not been supplied. Before the payment arrived this cancels the receive. Once the HTLC-recv VTXOs are granted they are dropped unclaimed, and the Ark server fails the inbound payment back to the sender when the invoice expires.",
+        "operationId": "abandon_hold_receive",
+        "parameters": [
+          {
+            "name": "payment_hash",
+            "in": "path",
+            "description": "Payment hash of the hold receive",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The receive was abandoned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmptyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The receive is not a hold receive, or its preimage was already supplied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No receive for this payment hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/lightning/receives/{payment_hash}/settle": {
+      "post": {
+        "tags": [
+          "lightning"
+        ],
+        "summary": "Settle a hold receive",
+        "description": "Supplies the preimage of a hold receive in the `awaiting_preimage` state and claims the payment. The preimage is stored before it is revealed, so after an internal error the call can be repeated, and the wallet also finishes the claim on its own. Repeating the call after the payment was claimed succeeds.",
+        "operationId": "settle_hold_receive",
+        "parameters": [
+          {
+            "name": "payment_hash",
+            "in": "path",
+            "description": "Payment hash of the hold receive",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LightningHoldSettleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The payment was claimed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmptyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The preimage doesn't match the payment hash, the receive is not a hold receive, or it doesn't await a preimage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No receive for this payment hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/lightning/sends/{identifier}": {
       "get": {
         "tags": [
           "lightning"
         ],
         "summary": "Get send status",
-        "description": "Returns the status of a specified outgoing Lightning payment, identified by its payment hash or invoice string. The `state` field tracks the payment lifecycle from `start` through `paid`; the preimage is included once the payment succeeded. If the wallet does not recognize the payment hash, it will return `unknown`. This is a read on the status in the db, so it does not trigger any `sync` before checking the state.",
+        "description": "Returns the status of a specified outgoing Lightning payment, identified by its payment hash or invoice string. The `state` field tracks the payment lifecycle from `start` through `paid` or `failed`; the preimage is included once the payment succeeded, and `failure_reason` once it failed. A failed payment stays failed: paying the same invoice again through this API is refused. If the wallet does not recognize the payment hash, it will return `unknown`. This is a read on the status in the db, so it does not trigger any `sync` before checking the state.",
         "operationId": "get_send_status",
         "parameters": [
           {
@@ -4130,6 +4318,10 @@
           }
         }
       },
+      "EmptyResponse": {
+        "type": "object",
+        "description": "An empty JSON object, for successful calls with nothing to report."
+      },
       "EncodedVtxo": {
         "type": "string",
         "description": "Hex-encoded serialized VTXO.\n\nSerializes as a plain hex string. Can be passed to\n`POST /wallet/import-vtxo` to re-import this VTXO."
@@ -5837,6 +6029,51 @@
           }
         }
       },
+      "LightningHoldInvoiceRequest": {
+        "type": "object",
+        "required": [
+          "amount_sat",
+          "payment_hash",
+          "expiry_secs"
+        ],
+        "properties": {
+          "amount_sat": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The amount to create the invoice for (in satoshis). This is the amount the payee will pay\nbut the final amount received by the client will have any server-configured\n[LightningReceiveFees](crate::cli::fees::LightningReceiveFees) deducted.",
+            "minimum": 0
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description embedded in the invoice as its memo."
+          },
+          "expiry_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "For how many seconds from now a payment is accepted. A payment arriving later is not\nclaimed. The invoice itself carries the Ark server's expiry.",
+            "minimum": 0
+          },
+          "payment_hash": {
+            "type": "string",
+            "description": "The payment hash of the invoice as 64 hex characters. The caller holds its preimage and\nsupplies it later to settle the receive."
+          }
+        }
+      },
+      "LightningHoldSettleRequest": {
+        "type": "object",
+        "required": [
+          "preimage"
+        ],
+        "properties": {
+          "preimage": {
+            "type": "string",
+            "description": "The preimage of the receive's payment hash as 64 hex characters."
+          }
+        }
+      },
       "LightningInvoiceForAddressRequest": {
         "type": "object",
         "required": [
@@ -5917,6 +6154,15 @@
             "type": "string",
             "description": "The invoice, offer, or lightning address to pay"
           },
+          "max_fee_sat": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The highest lightning send fee to pay (in satoshis). The payment is\nrefused before any funds are committed if its fee would be higher.\nAny fee is accepted when empty.",
+            "minimum": 0
+          },
           "retry_for_secs": {
             "type": [
               "integer",
@@ -5995,6 +6241,10 @@
             "description": "The timestamp at which the lightning receive was finished.",
             "deprecated": true
           },
+          "hold": {
+            "type": "boolean",
+            "description": "Whether this is a hold receive, whose preimage the caller supplies."
+          },
           "htlc_vtxo_ids": {
             "type": "array",
             "items": {
@@ -6044,7 +6294,7 @@
           },
           "state": {
             "type": "string",
-            "description": "Lifecycle phase of the receive: `awaiting-payment`, `htlcs-ready`,\n`preimage-revealed`, `delivering`, or `settled`."
+            "description": "Lifecycle phase of the receive: `awaiting-payment`, `htlcs-ready`,\n`awaiting_preimage`, `preimage-revealed`, `delivering`, or `settled`.\n\n`awaiting_preimage` replaces `htlcs-ready` for a hold receive whose\nHTLCs have been granted and that waits for its preimage."
           }
         }
       },
@@ -6085,6 +6335,13 @@
           "state"
         ],
         "properties": {
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the payment failed, set when `state` is `failed`."
+          },
           "invoice": {
             "type": [
               "string",
@@ -6105,7 +6362,7 @@
           },
           "state": {
             "type": "string",
-            "description": "Lifecycle phase of the send: `unknown`, `start`, `htlc-received`,\n`payment-initiated`, `revocable-htlcs`, `revocation-stuck`, or `paid`."
+            "description": "Lifecycle phase of the send: `unknown`, `start`, `htlc-received`,\n`payment-initiated`, `revocable-htlcs`, `revocation-stuck`, `paid`, or\n`failed`. Both `paid` and `failed` are final."
           }
         }
       },

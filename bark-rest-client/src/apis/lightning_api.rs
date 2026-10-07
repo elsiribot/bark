@@ -15,12 +15,31 @@ use crate::{apis::ResponseContent, models};
 use super::{Error, configuration, ContentType};
 
 
+/// struct for typed errors of method [`abandon_hold_receive`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AbandonHoldReceiveError {
+    Status400(models::BadRequestError),
+    Status404(models::NotFoundError),
+    Status500(models::InternalServerError),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`cancel_receive`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CancelReceiveError {
     Status400(models::BadRequestError),
     Status404(models::NotFoundError),
+    Status500(models::InternalServerError),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`generate_hold_invoice`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GenerateHoldInvoiceError {
+    Status400(models::BadRequestError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -78,6 +97,56 @@ pub enum PayError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`settle_hold_receive`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SettleHoldReceiveError {
+    Status400(models::BadRequestError),
+    Status404(models::NotFoundError),
+    Status500(models::InternalServerError),
+    UnknownValue(serde_json::Value),
+}
+
+
+/// Gives up on a hold receive whose preimage has not been supplied. Before the payment arrived this cancels the receive. Once the HTLC-recv VTXOs are granted they are dropped unclaimed, and the Ark server fails the inbound payment back to the sender when the invoice expires.
+pub async fn abandon_hold_receive(configuration: &configuration::Configuration, payment_hash: &str) -> Result<serde_json::Value, Error<AbandonHoldReceiveError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_payment_hash = payment_hash;
+
+    let uri_str = format!("{}/api/v1/lightning/receives/{payment_hash}/abandon", configuration.base_path, payment_hash=crate::apis::urlencode(p_path_payment_hash));
+    let mut req_builder = configuration.client.request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req).await?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text().await?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => return Err(Error::from(serde_json::Error::custom("Received `text/plain` content type response that cannot be converted to `serde_json::Value`"))),
+            ContentType::Unsupported(unknown_type) => return Err(Error::from(serde_json::Error::custom(format!("Received `{unknown_type}` content type response that cannot be converted to `serde_json::Value`")))),
+        }
+    } else {
+        let content = resp.text().await?;
+        let entity: Option<AbandonHoldReceiveError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent { status, content, entity }))
+    }
+}
 
 /// Cancels a pending Lightning receive identified by its payment hash or invoice string. The server will refuse cancellation if HTLC-recv VTXOs have already been granted. Bark also prevents cancellation when the preimage has been revealed.
 pub async fn cancel_receive(configuration: &configuration::Configuration, identifier: &str) -> Result<(), Error<CancelReceiveError>> {
@@ -104,6 +173,47 @@ pub async fn cancel_receive(configuration: &configuration::Configuration, identi
     } else {
         let content = resp.text().await?;
         let entity: Option<CancelReceiveError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent { status, content, entity }))
+    }
+}
+
+/// Generates a BOLT11 invoice for a payment hash whose preimage the caller holds, creating a pending hold receive. Once the payment arrives and the Ark server has granted the HTLC-recv VTXOs, the receive's state becomes `awaiting_preimage` and it waits for the caller to settle it with the preimage or abandon it. A payment arriving after `expiry_secs` is not claimed. Fails if the wallet already has a receive for the payment hash.
+pub async fn generate_hold_invoice(configuration: &configuration::Configuration, lightning_hold_invoice_request: models::LightningHoldInvoiceRequest) -> Result<models::InvoiceInfo, Error<GenerateHoldInvoiceError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_body_lightning_hold_invoice_request = lightning_hold_invoice_request;
+
+    let uri_str = format!("{}/api/v1/lightning/receives/hold-invoice", configuration.base_path);
+    let mut req_builder = configuration.client.request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_lightning_hold_invoice_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req).await?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text().await?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => return Err(Error::from(serde_json::Error::custom("Received `text/plain` content type response that cannot be converted to `models::InvoiceInfo`"))),
+            ContentType::Unsupported(unknown_type) => return Err(Error::from(serde_json::Error::custom(format!("Received `{unknown_type}` content type response that cannot be converted to `models::InvoiceInfo`")))),
+        }
+    } else {
+        let content = resp.text().await?;
+        let entity: Option<GenerateHoldInvoiceError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent { status, content, entity }))
     }
 }
@@ -230,7 +340,7 @@ pub async fn get_receive_status(configuration: &configuration::Configuration, id
     }
 }
 
-/// Returns the status of a specified outgoing Lightning payment, identified by its payment hash or invoice string. The `state` field tracks the payment lifecycle from `start` through `paid`; the preimage is included once the payment succeeded. If the wallet does not recognize the payment hash, it will return `unknown`. This is a read on the status in the db, so it does not trigger any `sync` before checking the state.
+/// Returns the status of a specified outgoing Lightning payment, identified by its payment hash or invoice string. The `state` field tracks the payment lifecycle from `start` through `paid` or `failed`; the preimage is included once the payment succeeded, and `failure_reason` once it failed. A failed payment stays failed: paying the same invoice again through this API is refused. If the wallet does not recognize the payment hash, it will return `unknown`. This is a read on the status in the db, so it does not trigger any `sync` before checking the state.
 pub async fn get_send_status(configuration: &configuration::Configuration, identifier: &str) -> Result<models::LightningSendInfo, Error<GetSendStatusError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_identifier = identifier;
@@ -308,7 +418,7 @@ pub async fn list_receive_statuses(configuration: &configuration::Configuration,
     }
 }
 
-/// Sends a payment to a Lightning destination. Accepts a BOLT11 invoice, BOLT12 offer, or Lightning address. The `amount_sat` field is required for Lightning addresses but optional for invoices and offers. Comments are only supported for Lightning addresses.
+/// Sends a payment to a Lightning destination. Accepts a BOLT11 invoice, BOLT12 offer, or Lightning address. The `amount_sat` field is required for Lightning addresses but optional for invoices and offers. Comments are only supported for Lightning addresses. With `max_fee_sat`, the payment is refused before any funds are committed if its fee would be higher. Paying an invoice whose earlier payment failed is refused, so a failure stays final. Returns once the payment has been started, so its status can be polled right away.
 pub async fn pay(configuration: &configuration::Configuration, lightning_pay_request: models::LightningPayRequest) -> Result<models::LightningPayResponse, Error<PayError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_body_lightning_pay_request = lightning_pay_request;
@@ -345,6 +455,48 @@ pub async fn pay(configuration: &configuration::Configuration, lightning_pay_req
     } else {
         let content = resp.text().await?;
         let entity: Option<PayError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent { status, content, entity }))
+    }
+}
+
+/// Supplies the preimage of a hold receive in the `awaiting_preimage` state and claims the payment. The preimage is stored before it is revealed, so after an internal error the call can be repeated, and the wallet also finishes the claim on its own. Repeating the call after the payment was claimed succeeds.
+pub async fn settle_hold_receive(configuration: &configuration::Configuration, payment_hash: &str, lightning_hold_settle_request: models::LightningHoldSettleRequest) -> Result<serde_json::Value, Error<SettleHoldReceiveError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_payment_hash = payment_hash;
+    let p_body_lightning_hold_settle_request = lightning_hold_settle_request;
+
+    let uri_str = format!("{}/api/v1/lightning/receives/{payment_hash}/settle", configuration.base_path, payment_hash=crate::apis::urlencode(p_path_payment_hash));
+    let mut req_builder = configuration.client.request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_lightning_hold_settle_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req).await?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text().await?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => return Err(Error::from(serde_json::Error::custom("Received `text/plain` content type response that cannot be converted to `serde_json::Value`"))),
+            ContentType::Unsupported(unknown_type) => return Err(Error::from(serde_json::Error::custom(format!("Received `{unknown_type}` content type response that cannot be converted to `serde_json::Value`")))),
+        }
+    } else {
+        let content = resp.text().await?;
+        let entity: Option<SettleHoldReceiveError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent { status, content, entity }))
     }
 }

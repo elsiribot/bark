@@ -591,8 +591,14 @@ pub struct LightningReceiveInfo {
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
 	/// Lifecycle phase of the receive: `awaiting-payment`, `htlcs-ready`,
-	/// `preimage-revealed`, `delivering`, or `settled`.
+	/// `awaiting_preimage`, `preimage-revealed`, `delivering`, or `settled`.
+	///
+	/// `awaiting_preimage` replaces `htlcs-ready` for a hold receive whose
+	/// HTLCs have been granted and that waits for its preimage.
 	pub state: String,
+	/// Whether this is a hold receive, whose preimage the caller supplies.
+	#[serde(default)]
+	pub hold: bool,
 	/// The invoice string, if known.
 	pub invoice: String,
 	/// The payment preimage, if known.
@@ -635,6 +641,8 @@ impl LightningReceiveInfo {
 			LightningReceiveState::Settled(s) => LightningReceiveInfo {
 				payment_hash: s.payment_hash,
 				state: "settled".to_string(),
+				// Not recorded for settled receives.
+				hold: false,
 				invoice: s.invoice.to_string(),
 				payment_preimage: Some(s.preimage),
 				amount: s.amount,
@@ -655,13 +663,17 @@ pub struct LightningSendInfo {
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
 	/// Lifecycle phase of the send: `unknown`, `start`, `htlc-received`,
-	/// `payment-initiated`, `revocable-htlcs`, `revocation-stuck`, or `paid`.
+	/// `payment-initiated`, `revocable-htlcs`, `revocation-stuck`, `paid`, or
+	/// `failed`. Both `paid` and `failed` are final.
 	pub state: String,
 	/// The invoice string, if known.
 	pub invoice: Option<String>,
 	/// The payment preimage, revealed once the payment succeeded.
 	#[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
 	pub preimage: Option<Preimage>,
+	/// Why the payment failed, set when `state` is `failed`.
+	#[serde(default)]
+	pub failure_reason: Option<String>,
 }
 
 impl LightningSendInfo {
@@ -673,18 +685,21 @@ impl LightningSendInfo {
 				state: "unknown".to_string(),
 				invoice: None,
 				preimage: None,
+				failure_reason: None,
 			},
 			LightningSendState::Paid(paid) => LightningSendInfo {
 				payment_hash: paid.payment_hash,
 				state: "paid".to_string(),
 				invoice: None,
 				preimage: Some(paid.preimage),
+				failure_reason: None,
 			},
-			LightningSendState::Failed { .. } => LightningSendInfo {
+			LightningSendState::Failed { reason } => LightningSendInfo {
 				payment_hash: hash,
 				state: "failed".to_string(),
 				invoice: None,
 				preimage: None,
+				failure_reason: Some(reason.clone()),
 			},
 			LightningSendState::InProgress(send) => {
 				let phase = match send.progress {
@@ -699,6 +714,7 @@ impl LightningSendInfo {
 					state: phase.to_string(),
 					invoice: Some(send.invoice.to_string()),
 					preimage: None,
+					failure_reason: None,
 				}
 			},
 		}
@@ -710,6 +726,9 @@ impl From<&LightningReceive> for LightningReceiveInfo {
 	fn from(recv: &LightningReceive) -> Self {
 		let (state, htlc_vtxo_ids) = match &recv.progress {
 			ReceiveProgress::AwaitingPayment => ("awaiting-payment", vec![]),
+			ReceiveProgress::HtlcsReady(htlcs) if recv.is_awaiting_preimage() => {
+				("awaiting_preimage", htlcs.vtxo_ids.clone())
+			},
 			ReceiveProgress::HtlcsReady(htlcs) => ("htlcs-ready", htlcs.vtxo_ids.clone()),
 			ReceiveProgress::PreimageRevealed(htlcs) => ("preimage-revealed", htlcs.vtxo_ids.clone()),
 			// The HTLCs are spent once the claim outputs await delivery.
@@ -718,6 +737,7 @@ impl From<&LightningReceive> for LightningReceiveInfo {
 		LightningReceiveInfo {
 			payment_hash: recv.payment_hash,
 			state: state.to_string(),
+			hold: recv.is_hold(),
 			invoice: recv.invoice.to_string(),
 			payment_preimage: recv.payment_preimage,
 			amount: recv.invoice.amount_milli_satoshis()
@@ -734,6 +754,8 @@ impl From<&LightningReceive> for LightningReceiveInfo {
 
 #[cfg(test)]
 mod test {
+	use std::str::FromStr;
+
 	use bitcoin::FeeRate;
 	use super::*;
 
@@ -752,6 +774,101 @@ mod test {
 	fn deserialize_lightning_receive_htlc_vtxo_ids_missing() {
 		let json = lightning_receive_base_json();
 		serde_json::from_value::<LightningReceiveInfo>(json).unwrap();
+	}
+
+	#[test]
+	fn deserialize_lightning_receive_hold_missing() {
+		let json = lightning_receive_base_json();
+		let info = serde_json::from_value::<LightningReceiveInfo>(json).unwrap();
+		assert!(!info.hold);
+	}
+
+	const TEST_INVOICE_STR: &str = "lntbs100u1p5j0x82sp5d0rwfh7tgrrlwsegy9rx3tzpt36cqwjqza5x4wvcjxjzscfaf6jspp5d8q7354dg3p8h0kywhqq5dq984r8f5en98hf9ln85ug0w8fx6hhsdqqcqzpc9qyysgqyk54v7tpzprxll7e0jyvtxcpgwttzk84wqsfjsqvcdtq47zt2wssxsmtjhz8dka62mdnf9jafhu3l4cpyfnsx449v4wstrwzzql2w5qqs8uh7p";
+
+	fn test_receive(
+		preimage: Option<Preimage>,
+		hold_deadline: Option<u64>,
+		progress: ReceiveProgress,
+	) -> LightningReceive {
+		let invoice = bark::lightning_invoice::Bolt11Invoice::from_str(TEST_INVOICE_STR).unwrap();
+		LightningReceive {
+			payment_hash: PaymentHash::from(&invoice),
+			invoice,
+			payment_preimage: preimage,
+			htlc_recv_cltv_delta: BlockDelta::new(250),
+			anti_dos_token: None,
+			claim_destination: None,
+			key_index: 0,
+			hold_deadline,
+			progress,
+		}
+	}
+
+	#[test]
+	fn hold_receive_awaiting_preimage_state() {
+		let htlcs = bark::actions::lightning::receive::Htlcs {
+			vtxo_ids: vec![],
+			movement_id: bark::movement::MovementId::new(1),
+		};
+		let preimage = Preimage::from_str(
+			"0101010101010101010101010101010101010101010101010101010101010101",
+		).unwrap();
+
+		let awaiting = LightningReceiveInfo::from(
+			&test_receive(None, Some(100), ReceiveProgress::HtlcsReady(htlcs.clone())),
+		);
+		assert_eq!(awaiting.state, "awaiting_preimage");
+		assert!(awaiting.hold);
+		assert_eq!(awaiting.payment_preimage, None);
+		// Clients read the amount from the full invoice.
+		assert_eq!(awaiting.invoice, TEST_INVOICE_STR);
+		let json = serde_json::to_value(&awaiting).unwrap();
+		assert_eq!(json["state"], "awaiting_preimage");
+		assert_eq!(json["hold"], true);
+
+		let unpaid = LightningReceiveInfo::from(
+			&test_receive(None, Some(100), ReceiveProgress::AwaitingPayment),
+		);
+		assert_eq!(unpaid.state, "awaiting-payment");
+		assert!(unpaid.hold);
+
+		let settling = LightningReceiveInfo::from(
+			&test_receive(Some(preimage), Some(100), ReceiveProgress::HtlcsReady(htlcs.clone())),
+		);
+		assert_eq!(settling.state, "htlcs-ready");
+
+		let regular = LightningReceiveInfo::from(
+			&test_receive(Some(preimage), None, ReceiveProgress::HtlcsReady(htlcs)),
+		);
+		assert_eq!(regular.state, "htlcs-ready");
+		assert!(!regular.hold);
+	}
+
+	#[test]
+	fn lightning_send_failed_state() {
+		let hash = PaymentHash::from_str(
+			"0000000000000000000000000000000000000000000000000000000000000000",
+		).unwrap();
+		let state = LightningSendState::Failed { reason: "no route".to_string() };
+		let info = LightningSendInfo::from_state(hash, &state);
+		assert_eq!(info.state, "failed");
+		assert_eq!(info.failure_reason.as_deref(), Some("no route"));
+		assert_eq!(info.preimage, None);
+
+		let json = serde_json::to_value(&info).unwrap();
+		assert_eq!(json["state"], "failed");
+		assert_eq!(json["failure_reason"], "no route");
+
+		let unknown = LightningSendInfo::from_state(hash, &LightningSendState::Unknown);
+		let json = serde_json::to_value(&unknown).unwrap();
+		assert_eq!(json["state"], "unknown");
+		assert_eq!(json["failure_reason"], serde_json::Value::Null);
+
+		// Older barkd doesn't send the field.
+		let mut json = json;
+		json.as_object_mut().unwrap().remove("failure_reason");
+		let parsed = serde_json::from_value::<LightningSendInfo>(json).unwrap();
+		assert_eq!(parsed.failure_reason, None);
 	}
 
 	#[test]
