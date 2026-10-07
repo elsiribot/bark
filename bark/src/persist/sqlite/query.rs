@@ -22,7 +22,8 @@ use crate::exit::{ExitState, ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::persist::{RoundStateId, StoredRoundState};
 use crate::persist::models::{
-	PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit, Unlocked,
+	FailedLightningSend, PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit,
+	Unlocked,
 };
 use crate::persist::sqlite::convert::{row_to_movement, row_to_wallet_vtxo, rows_to_wallet_vtxos};
 use crate::round::RoundState;
@@ -1062,6 +1063,42 @@ pub fn get_paid_invoice(
 		.context("invalid preimage hex in bark_paid_invoice")?;
 	let paid_at: chrono::DateTime<chrono::Local> = row.get("paid_at")?;
 	Ok(Some(PaidInvoice { payment_hash, preimage, paid_at }))
+}
+
+
+pub fn record_failed_lightning_send(
+	conn: &Connection,
+	payment_hash: PaymentHash,
+	reason: &str,
+) -> anyhow::Result<()> {
+	let query = "
+		INSERT INTO bark_failed_lightning_send (payment_hash, reason)
+		VALUES (:payment_hash, :reason)
+		ON CONFLICT(payment_hash) DO NOTHING";
+	let mut statement = conn.prepare(query)?;
+	statement.execute(named_params! {
+		":payment_hash": payment_hash.as_hex().to_string(),
+		":reason": reason,
+	})?;
+	Ok(())
+}
+
+pub fn get_failed_lightning_send(
+	conn: &Connection,
+	payment_hash: PaymentHash,
+) -> anyhow::Result<Option<FailedLightningSend>> {
+	let query = "SELECT reason, failed_at FROM bark_failed_lightning_send
+		WHERE payment_hash = :payment_hash";
+	let mut statement = conn.prepare(query)?;
+	let mut rows = statement.query(named_params! { ":payment_hash": payment_hash.as_hex().to_string() })?;
+
+	let row = match rows.next()? {
+		Some(row) => row,
+		None => return Ok(None),
+	};
+	let reason: String = row.get("reason")?;
+	let failed_at: chrono::DateTime<chrono::Local> = row.get("failed_at")?;
+	Ok(Some(FailedLightningSend { payment_hash, reason, failed_at }))
 }
 
 

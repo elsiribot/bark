@@ -45,7 +45,8 @@ use crate::WalletProperties;
 use crate::actions::{WalletActionCheckpoint, WalletActionId};
 use crate::exit::{ExitTxOrigin, ExitStateKind};
 use crate::persist::models::{
-	PaidInvoice, RoundStateId, SettledLightningReceive, StoredExit, StoredRoundState, Unlocked,
+	FailedLightningSend, PaidInvoice, RoundStateId, SettledLightningReceive, StoredExit,
+	StoredRoundState, Unlocked,
 };
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::movement::update::MovementUpdate;
@@ -518,6 +519,22 @@ pub trait BarkPersister: Send + Sync + 'static {
 		&self,
 		payment_hash: PaymentHash,
 	) -> anyhow::Result<Option<PaidInvoice>>;
+
+	/// Record a terminally failed outgoing lightning send.
+	///
+	/// Idempotent: a subsequent call with the same payment_hash is a
+	/// no-op (the existing row wins).
+	async fn record_failed_lightning_send(
+		&self,
+		payment_hash: PaymentHash,
+		reason: &str,
+	) -> anyhow::Result<()>;
+
+	/// Look up a failed lightning send record by payment hash.
+	async fn get_failed_lightning_send(
+		&self,
+		payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<FailedLightningSend>>;
 
 	/// Record a settled incoming lightning receive, ignore if already exists.
 	async fn record_settled_lightning_receive(

@@ -72,7 +72,7 @@ use crate::movement::{
 use crate::movement::update::MovementUpdate;
 use crate::persist::BarkPersister;
 use crate::persist::models::{
-	PaidInvoice, RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
+	FailedLightningSend, PaidInvoice, RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
 	SettledLightningReceive, StoredExit, StoredRoundState, Unlocked, wallet_vtxo_from_full,
 };
 use crate::round::RoundState;
@@ -117,6 +117,9 @@ pub mod partition {
 	/// An index from [WalletActionId] to the movement that action owns, so a
 	/// re-driven action step reuses its movement instead of duplicating it.
 	pub const MOVEMENT_ACTION: u8 = 17;
+	/// Permanent record of every failed outgoing lightning payment, keyed
+	/// by payment hash.
+	pub const FAILED_LIGHTNING_SEND: u8 = 18;
 
 	pub const LAST_IDS: u8 = u8::MAX;
 }
@@ -1054,6 +1057,38 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	) -> anyhow::Result<Option<PaidInvoice>> {
 		match self.inner.read().await
 			.get(partition::PAID_INVOICE, &payment_hash.to_byte_array()).await?
+		{
+			Some(record) => Ok(Some(record.to_data()?)),
+			None => Ok(None),
+		}
+	}
+
+	async fn record_failed_lightning_send(
+		&self,
+		payment_hash: PaymentHash,
+		reason: &str,
+	) -> anyhow::Result<()> {
+		let key = payment_hash.to_byte_array();
+		// Idempotent: preserve the original record across retries.
+		let mut lock = self.inner.write().await;
+		if lock.get(partition::FAILED_LIGHTNING_SEND, &key).await?.is_some() {
+			return Ok(());
+		}
+		let failed = FailedLightningSend {
+			payment_hash,
+			reason: reason.to_string(),
+			failed_at: chrono::Local::now(),
+		};
+		let record = Record::from_data(partition::FAILED_LIGHTNING_SEND, &key, None, &failed)?;
+		lock.put(record).await
+	}
+
+	async fn get_failed_lightning_send(
+		&self,
+		payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<FailedLightningSend>> {
+		match self.inner.read().await
+			.get(partition::FAILED_LIGHTNING_SEND, &payment_hash.to_byte_array()).await?
 		{
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),

@@ -182,6 +182,19 @@ pub struct PaidInvoice {
 	pub paid_at: chrono::DateTime<chrono::Local>,
 }
 
+/// Permanent record of an outgoing lightning send that failed.
+///
+/// Written once a send has terminally failed (its HTLCs are revoked or
+/// exited, or it never got going); never deleted. Used by
+/// [`crate::actions::lightning::pay`] to report the failure and to refuse
+/// paying the same invoice again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedLightningSend {
+	pub payment_hash: PaymentHash,
+	pub reason: String,
+	pub failed_at: chrono::DateTime<chrono::Local>,
+}
+
 /// Permanent record of a fully-settled incoming lightning receive.
 ///
 /// Written when an inbound payment is claimed (the wallet has obtained

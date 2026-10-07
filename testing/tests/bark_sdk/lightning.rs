@@ -292,8 +292,8 @@ async fn pay_hold_refused() {
 		payment_hash: payment_hash.as_ref().to_vec(),
 	}).await.expect("cancel hold invoice");
 
-	// On failure the LightningSend record is removed once revocation completes, so the state
-	// is Unknown. With CLN 26.06, xpay reports the destination failure before CLN's own sendpay
+	// On failure the LightningSend record is replaced by a permanent failure record once
+	// revocation completes, so the state is Failed. With CLN 26.06, xpay reports the destination failure before CLN's own sendpay
 	// row transitions to failed, so captaind's immediate listpays reconciliation still sees
 	// Pending and marks the attempt Submitted. It only flips to Failed on the next
 	// process_payment_attempts tick past cln_xpay_timeout + XPAY_TIMEOUT_BUFFER (5s + 15s)
@@ -301,11 +301,11 @@ async fn pay_hold_refused() {
 	// BARK_DOUBLE_DRIVE_ACTIONS + a couple of bark re-poll intervals.
 	let status = waiter.wait_millis(40_000).await.expect("join waiter")
 		.expect("waiting check errored");
-	assert_eq!(status, LightningSendState::Unknown);
+	assert!(matches!(status, LightningSendState::Failed { .. }), "expected Failed, got {:?}", status);
 
-	// A subsequent check should also report Unknown
+	// A subsequent check should also report Failed
 	let new_status = wallet.check_lightning_payment(payment_hash, false).await.expect("Failed to query lightning send");
-	assert_eq!(new_status, LightningSendState::Unknown);
+	assert_eq!(new_status, status);
 
 	// After revocation the HTLC vtxos come back as spendable
 	let balance = assert_balance_consistent(&wallet, false).await;

@@ -34,6 +34,18 @@ pub struct LightningSendOptions {
 	/// How long the server keeps trying to pay, capped to the server's
 	/// maximum. `None` leaves it to the server.
 	pub retry_for: Option<Duration>,
+	/// The highest lightning send fee to pay. A payment whose fee would be
+	/// higher is refused before any funds are committed. `None` accepts any
+	/// fee.
+	///
+	/// Only checked when a payment starts, not when one is resumed.
+	pub max_fee: Option<Amount>,
+	/// Refuse to pay an invoice whose earlier payment failed, so that a
+	/// failure reported by [`Wallet::lightning_send_state`] stays final.
+	///
+	/// Off by default: paying a failed invoice again is usually safe, and a
+	/// later attempt may succeed where the first one found no route.
+	pub refuse_after_failure: bool,
 }
 
 impl LightningSendOptions {
@@ -44,6 +56,16 @@ impl LightningSendOptions {
 
 	pub fn retry_for(mut self, retry_for: Option<Duration>) -> Self {
 		self.retry_for = retry_for;
+		self
+	}
+
+	pub fn max_fee(mut self, max_fee: Option<Amount>) -> Self {
+		self.max_fee = max_fee;
+		self
+	}
+
+	pub fn refuse_after_failure(mut self, refuse: bool) -> Self {
+		self.refuse_after_failure = refuse;
 		self
 	}
 }
@@ -129,15 +151,20 @@ impl Wallet {
 			.and_then(|cp| cp.into_lightning_send()))
 	}
 
-	/// Triage a payment hash: paid, in-progress, or unknown.
+	/// Triage a payment hash: paid, in-progress, failed, or unknown.
 	pub async fn lightning_send_state(&self, hash: PaymentHash)
 		-> anyhow::Result<LightningSendState>
 	{
 		if let Some(paid) = self.inner.db.get_paid_invoice(hash).await? {
 			return Ok(LightningSendState::Paid(paid));
 		}
+		// A send can record its failure before it finishes revoking its
+		// HTLCs, so the checkpoint takes precedence.
 		if let Some(cp) = self.lightning_send_checkpoint(hash).await? {
 			return Ok(LightningSendState::InProgress(cp));
+		}
+		if let Some(failed) = self.inner.db.get_failed_lightning_send(hash).await? {
+			return Ok(LightningSendState::Failed { reason: failed.reason });
 		}
 		Ok(LightningSendState::Unknown)
 	}
@@ -375,12 +402,21 @@ impl Wallet {
 			.context("Payment operation already in progress for this invoice")?;
 
 		// Resume an existing checkpoint, or build a fresh send. A resumed
-		// send keeps the retry time it was started with.
+		// send keeps the retry time and fee it was started with.
 		let action = match self.lightning_send_checkpoint(payment_hash).await? {
 			Some(existing) => existing,
 			None => {
+				// Callers may rely on a failure being final, e.g. once they
+				// refunded whoever they paid on behalf of.
+				if opts.refuse_after_failure
+					&& let Some(failed) = self.inner.db.get_failed_lightning_send(payment_hash).await?
+				{
+					bail!("A payment to this invoice already failed: {}", failed.reason);
+				}
+
 				let start = start_lightning_send(
-					self, invoice.clone(), user_amount, original_payment_method, opts.retry_for,
+					self, invoice.clone(), user_amount, original_payment_method,
+					opts.retry_for, opts.max_fee,
 				).await?;
 
 				self.inner.db.upsert_wallet_action_checkpoint(

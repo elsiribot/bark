@@ -222,11 +222,12 @@ async fn external_send_revokes_after_upgrade() {
 		payment_hash: payment_hash.as_ref().to_vec(),
 	}).await.expect("cancel hold invoice");
 
-	// On failure the send record is removed once revocation completes.
+	// On failure the send record is replaced by a permanent failure record
+	// once revocation completes.
 	let status = wallet.check_lightning_payment(payment_hash, true)
 		.wait_millis(60_000).await
 		.expect("check_lightning_payment errored");
-	assert_eq!(status, LightningSendState::Unknown);
+	assert!(matches!(status, LightningSendState::Failed { .. }), "expected Failed, got {:?}", status);
 
 	let balance = wallet.balance().await.expect("balance");
 	assert_eq!(balance.spendable, board_amount);

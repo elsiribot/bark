@@ -99,6 +99,9 @@ macro_rules! bark_persister_tests {
 			test_paid_invoice_record_and_get,
 			test_paid_invoice_record_is_idempotent,
 			test_paid_invoice_get_missing,
+			test_failed_lightning_send_record_and_get,
+			test_failed_lightning_send_record_is_idempotent,
+			test_failed_lightning_send_get_missing,
 			test_settled_lightning_receive_record_and_get,
 			test_settled_lightning_receive_record_is_idempotent,
 			test_settled_lightning_receive_get_missing,
@@ -245,6 +248,10 @@ fn send_at_revocable_htlcs() -> LightningSend {
 
 fn paid_invoice_hash() -> PaymentHash {
 	PaymentHash::from_slice(&[0xcdu8; 32]).unwrap()
+}
+
+fn failed_send_hash() -> PaymentHash {
+	PaymentHash::from_slice(&[0xabu8; 32]).unwrap()
 }
 
 fn settled_receive_hash() -> PaymentHash {
@@ -860,6 +867,33 @@ pub async fn test_paid_invoice_record_is_idempotent(db: &impl BarkPersister) {
 pub async fn test_paid_invoice_get_missing(db: &impl BarkPersister) {
 	let hash = PaymentHash::from_slice(&[0x55u8; 32]).unwrap();
 	let stored = db.get_paid_invoice(hash).await.unwrap();
+	assert!(stored.is_none(), "missing hash returns None");
+}
+
+pub async fn test_failed_lightning_send_record_and_get(db: &impl BarkPersister) {
+	let hash = failed_send_hash();
+
+	db.record_failed_lightning_send(hash, "no route").await.unwrap();
+
+	let stored = db.get_failed_lightning_send(hash).await.expect("get").expect("present");
+	assert_eq!(stored.payment_hash, hash, "payment hash round-trip");
+	assert_eq!(stored.reason, "no route", "reason round-trip");
+}
+
+pub async fn test_failed_lightning_send_record_is_idempotent(db: &impl BarkPersister) {
+	let hash = failed_send_hash();
+
+	db.record_failed_lightning_send(hash, "no route").await.unwrap();
+	db.record_failed_lightning_send(hash, "something else").await
+		.expect("second record should be a no-op");
+
+	let stored = db.get_failed_lightning_send(hash).await.unwrap().expect("row still present");
+	assert_eq!(stored.reason, "no route", "original reason preserved");
+}
+
+pub async fn test_failed_lightning_send_get_missing(db: &impl BarkPersister) {
+	let hash = PaymentHash::from_slice(&[0x77u8; 32]).unwrap();
+	let stored = db.get_failed_lightning_send(hash).await.unwrap();
 	assert!(stored.is_none(), "missing hash returns None");
 }
 

@@ -31,7 +31,7 @@ use bark::movement::{
 use bark::movement::update::MovementUpdate;
 use bark::persist::BarkPersister;
 use bark::persist::models::{
-	PaidInvoice, StoredExit, StoredRoundState, Unlocked, RoundStateId, SerdeRoundState,
+	FailedLightningSend, PaidInvoice, StoredExit, StoredRoundState, Unlocked, RoundStateId, SerdeRoundState,
 };
 use bark::round::RoundState;
 use bark::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
@@ -185,6 +185,21 @@ impl BarkPersister for Dummy {
 		&self,
 		_payment_hash: PaymentHash,
 	) -> anyhow::Result<Option<PaidInvoice>> {
+		Ok(None)
+	}
+
+	async fn record_failed_lightning_send(
+		&self,
+		_payment_hash: PaymentHash,
+		_reason: &str,
+	) -> anyhow::Result<()> {
+		Ok(())
+	}
+
+	async fn get_failed_lightning_send(
+		&self,
+		_payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<FailedLightningSend>> {
 		Ok(None)
 	}
 

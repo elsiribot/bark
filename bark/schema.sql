@@ -221,3 +221,8 @@ CREATE VIEW vtxo_view AS
 			JOIN most_recent_vtxo_state as vs
 				ON v.id = vs.vtxo_id
 /* vtxo_view(id,expiry_height,amount_sat,raw_bare,exit_depth,exit_tx_weight,registered,created_at,state,state_kind,last_updated_at) */;
+CREATE TABLE bark_failed_lightning_send (
+				payment_hash TEXT PRIMARY KEY,
+				reason       TEXT NOT NULL,
+				failed_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+			);

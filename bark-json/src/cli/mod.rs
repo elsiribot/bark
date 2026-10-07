@@ -680,6 +680,12 @@ impl LightningSendInfo {
 				invoice: None,
 				preimage: Some(paid.preimage),
 			},
+			LightningSendState::Failed { .. } => LightningSendInfo {
+				payment_hash: hash,
+				state: "failed".to_string(),
+				invoice: None,
+				preimage: None,
+			},
 			LightningSendState::InProgress(send) => {
 				let phase = match send.progress {
 					SendProgress::Start => "start",

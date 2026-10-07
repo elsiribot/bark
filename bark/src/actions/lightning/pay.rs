@@ -47,13 +47,21 @@ pub(crate) fn ln_pay_action_id(payment_hash: PaymentHash) -> WalletActionId {
 ///
 /// `Paid` records come from `bark_paid_invoice` and are kept forever.
 /// `InProgress` records come from `bark_wallet_action_checkpoint`.
+/// `Failed` records come from `bark_failed_lightning_send` and are kept
+/// forever.
 /// `Unknown` means the wallet has no memory of this payment hash.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LightningSendState {
 	Unknown,
 	InProgress(LightningSend),
 	Paid(PaidInvoice),
+	Failed { reason: String },
 }
+
+/// Reason recorded when the server reports the payment as failed.
+const FAILED_BY_SERVER: &str = "the Ark server reported the payment as failed";
+/// Reason recorded when a payment is still pending as its HTLCs near expiry.
+const FAILED_NEAR_EXPIRY: &str = "the payment did not complete before its HTLCs neared expiry";
 
 /// An outgoing lightning payment, persisted as a single checkpoint row
 /// and driven across crashes by the executor.
@@ -148,12 +156,16 @@ impl WalletAction for LightningSend {
 						return Ok(Advance::Done);
 					},
 					PaymentStatus::Failed => {
-						let revocation = fail_lightning_send_payment(wallet, &self).await?;
+						let revocation = fail_lightning_send_payment(
+							wallet, &self, FAILED_BY_SERVER,
+						).await?;
 						Progress::RevocableHtlcs { htlcs, revocation }
 					},
 					PaymentStatus::Pending => {
 						if self.is_htlc_near_expiry(wallet).await? {
-							let revocation = fail_lightning_send_payment(wallet, &self).await?;
+							let revocation = fail_lightning_send_payment(
+								wallet, &self, FAILED_NEAR_EXPIRY,
+							).await?;
 							Progress::RevocableHtlcs { htlcs, revocation }
 						} else {
 							return Ok(Advance::Park {
@@ -198,13 +210,16 @@ impl WalletAction for LightningSend {
 			Progress::Start => {
 				if self.is_htlc_near_expiry(wallet).await? {
 					let err = anyhow!("Could not start lightning send and HTLCs are near expiry");
+					record_lightning_send_failure(wallet, &self, &format!("{:#}", err)).await?;
 					return Ok(Advance::Failed(err));
 				}
 			},
 			Progress::HtlcReceived(htlcs) |
 			Progress::PaymentInitiated(htlcs) => {
 				if self.is_htlc_near_expiry(wallet).await? {
-					let revocation = fail_lightning_send_payment(wallet, &self).await?;
+					let revocation = fail_lightning_send_payment(
+						wallet, &self, FAILED_NEAR_EXPIRY,
+					).await?;
 					let next = LightningSend {
 						progress: Progress::RevocableHtlcs { htlcs, revocation },
 						..self
@@ -241,6 +256,8 @@ impl WalletAction for LightningSend {
 			Progress::Start => {
 				let id = self.id();
 				error!("Could not start lightning send {}: {:?}", id, error);
+				let reason = format!("the Ark server rejected the payment: {:#}", error);
+				record_lightning_send_failure(wallet, &self, &reason).await?;
 				if let Err(cancel_err) = wallet.stop_wallet_action(&id).await {
 					warn!("could not cancel start-phase lightning send {}: {:#}", id, cancel_err);
 				}
@@ -248,7 +265,8 @@ impl WalletAction for LightningSend {
 			},
 			Progress::HtlcReceived(htlcs) |
 			Progress::PaymentInitiated(htlcs) => {
-				let revocation = fail_lightning_send_payment(wallet, &self).await?;
+				let reason = format!("the Ark server rejected the payment: {:#}", error);
+				let revocation = fail_lightning_send_payment(wallet, &self, &reason).await?;
 				let next = LightningSend {
 					progress: Progress::RevocableHtlcs { htlcs, revocation },
 					..self
@@ -330,6 +348,7 @@ pub(crate) async fn start_lightning_send(
 	user_amount: Option<Amount>,
 	original_payment_method: PaymentMethod,
 	retry_for: Option<Duration>,
+	max_fee: Option<Amount>,
 ) -> anyhow::Result<LightningSend> {
 	let (_, ark_info) = wallet.require_server().await?;
 	let tip = wallet.inner.chain.tip().await?;
@@ -350,6 +369,9 @@ pub(crate) async fn start_lightning_send(
 		payment_amount,
 		|a, v| ark_info.fees.lightning_send.calculate(a, v).context("fee overflowed"),
 	).await.context("Could not find enough suitable VTXOs to cover lightning payment")?;
+	if let Some(max_fee) = max_fee {
+		ensure!(fee <= max_fee, "Lightning send fee {} exceeds the maximum fee {}", fee, max_fee);
+	}
 
 	let input_total = inputs.iter().map(|v| v.amount()).sum::<Amount>();
 	let change = input_total.checked_sub(payment_amount + fee)
@@ -640,14 +662,32 @@ pub(crate) async fn settle_lightning_send_payment(
 	Ok(())
 }
 
-/// PaymentInitiated -> RevocableHtlcs. Derives a revocation keypair;
-/// the actual server-side cosign happens in
+/// Write the permanent record of a failed send, so the failure is still
+/// known once the checkpoint is gone. Idempotent: the first reason wins.
+pub(crate) async fn record_lightning_send_failure(
+	wallet: &Wallet,
+	send: &LightningSend,
+	reason: &str,
+) -> anyhow::Result<()> {
+	wallet.inner.db.record_failed_lightning_send(send.invoice.payment_hash(), reason).await
+		.context("failed to record failed lightning send")
+}
+
+/// PaymentInitiated -> RevocableHtlcs. Records the failure and derives a
+/// revocation keypair; the actual server-side cosign happens in
 /// [`revoke_lightning_send_htlcs`].
+///
+/// The failure is recorded here rather than once revocation finishes: the
+/// payment can't succeed anymore, and the checkpoint outlives revocation
+/// either way, so the record only shows once the send is terminal.
 pub(crate) async fn fail_lightning_send_payment(
 	wallet: &Wallet,
 	send: &LightningSend,
+	reason: &str,
 ) -> anyhow::Result<Revocation> {
-	info!("Lightning payment {} failed, preparing to revoke", send.invoice.payment_hash());
+	info!("Lightning payment {} failed, preparing to revoke: {}",
+		send.invoice.payment_hash(), reason);
+	record_lightning_send_failure(wallet, send, reason).await?;
 	// Use the key pre-derived at start so re-driving is idempotent; older
 	// checkpoints without it (`None`) derive on demand.
 	// TODO: remove this `None` fallback (and make `revocation_key` non-optional)

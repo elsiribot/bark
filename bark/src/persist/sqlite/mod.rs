@@ -33,7 +33,9 @@ use crate::exit::{ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::movement::update::MovementUpdate;
 use crate::persist::{BarkPersister, RoundStateId, StoredRoundState, Unlocked};
-use crate::persist::models::{PaidInvoice, SettledLightningReceive, StoredExit};
+use crate::persist::models::{
+	FailedLightningSend, PaidInvoice, SettledLightningReceive, StoredExit,
+};
 use crate::round::RoundState;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
@@ -339,6 +341,23 @@ impl BarkPersister for SqliteClient {
 	) -> anyhow::Result<Option<PaidInvoice>> {
 		let conn = self.connect()?;
 		query::get_paid_invoice(&conn, payment_hash)
+	}
+
+	async fn record_failed_lightning_send(
+		&self,
+		payment_hash: PaymentHash,
+		reason: &str,
+	) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::record_failed_lightning_send(&conn, payment_hash, reason)
+	}
+
+	async fn get_failed_lightning_send(
+		&self,
+		payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<FailedLightningSend>> {
+		let conn = self.connect()?;
+		query::get_failed_lightning_send(&conn, payment_hash)
 	}
 
 	async fn record_settled_lightning_receive(
